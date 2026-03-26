@@ -7,10 +7,10 @@ from scipy.interpolate import RegularGridInterpolator
 
 def solve_dp(
     n=3, T=9, r=0.07, A=0.5,
-    a_k=None, s_k=None,
-    max_turnover=0.10, leverage_factor=2.0,
+    a_k=None, s_k=None, p_init=None,
+    max_turnover=0.10, leverage_factor=1.0,
     wealth_points=15, wealth_min=0.05, wealth_max=3.5,
-    prop_min=-0.5, prop_max=1.5, prop_step=0.25,
+    prop_min=None, prop_max=None, prop_step=0.25,
     action_step=0.05, action_max=0.10,
     n_quad=5,
 ):
@@ -21,9 +21,22 @@ def solve_dp(
         policy:  dict mapping time step -> optimal action array
         config:  dict with all grid/parameter info needed for simulation
     """
+    # Auto-derive prop range from leverage_factor if not explicitly set
+    if prop_min is None:
+        prop_min = -(leverage_factor - 1.0) / 2.0
+    if prop_max is None:
+        prop_max = (leverage_factor + 1.0) / 2.0
+
     a_k = np.array(a_k if a_k is not None else [0.08, 0.06, 0.10][:n])
     s_k = np.array(s_k if s_k is not None else [0.02, 0.015, 0.04][:n])
     std_k = np.sqrt(s_k)
+
+    # Default p_init: 40% cash, rest equally split among risky assets
+    if p_init is None:
+        w = 0.60 / n
+        p_init = np.array([1.0 - n * w] + [w] * n)
+    else:
+        p_init = np.array(p_init, dtype=float)
 
     def utility_function(W):
         return (1.0 - np.exp(-A * np.clip(W, -20, 100))) / A
@@ -64,6 +77,13 @@ def solve_dp(
     d_cash = -all_actions.sum(axis=1)
     turnover = 0.5 * (np.abs(d_cash) + np.abs(all_actions).sum(axis=1))
     valid_actions = all_actions[turnover <= max_turnover + 1e-10]
+
+    # Find zero action index for tie-breaking
+    zero_act_idx = None
+    for ai, a in enumerate(valid_actions):
+        if np.allclose(a, 0.0):
+            zero_act_idx = ai
+            break
 
     Q = len(joint_weights)
     print(f"Setup: n={n}, T={T}, r={r}, A={A}")
@@ -106,8 +126,10 @@ def solve_dp(
         pol_t = np.zeros(grid_shape + (n,))
         n_computed = 0
 
+        Q = len(joint_weights)
+
         for wi, w in enumerate(w_grid):
-            max_lev = 1.0 + leverage_factor * max(w, 0.0)
+            max_lev = leverage_factor
 
             for pi, pidx in enumerate(all_p_indices):
                 p_risky = all_p_values[pi]
@@ -117,44 +139,63 @@ def solve_dp(
                     V_t[(wi,) + pidx] = utility_function(0.01)
                     continue
 
-                best_val = -np.inf
-                best_act = None
+                # All candidate allocations at once: (N_act, n)
+                new_p = p_risky + valid_actions
+                new_cash = 1.0 - new_p.sum(axis=1)
 
-                for a in valid_actions:
-                    p_new = p_risky + a
-                    new_cash = 1.0 - p_new.sum()
+                # Filter by leverage constraint
+                gross = np.abs(new_cash) + np.abs(new_p).sum(axis=1)
+                fidx = np.where(gross <= max_lev + 1e-10)[0]
 
-                    gross = np.abs(new_cash) + np.abs(p_new).sum()
-                    if gross > max_lev + 1e-10:
-                        continue
+                if len(fidx) == 0:
+                    V_t[(wi,) + pidx] = utility_function(0.01)
+                    continue
 
-                    port_ret = new_cash * r + joint_returns @ p_new
-                    w_next = w * (1.0 + port_ret)
+                new_p_f = new_p[fidx]          # (F, n)
+                new_cash_f = new_cash[fidx]    # (F,)
+                F = len(fidx)
 
-                    denom = 1.0 + port_ret
-                    p_next = (p_new * (1.0 + joint_returns)) / denom[:, np.newaxis]
+                # Portfolio returns for all actions × all scenarios: (F, Q)
+                port_ret = new_cash_f[:, None] * r + new_p_f @ joint_returns.T
 
-                    w_clip = np.clip(w_next, w_grid[0], w_grid[-1])
-                    p_clip = np.clip(p_next, p_single_grid[0], p_single_grid[-1])
+                # Next-period wealth: (F, Q)
+                w_next = w * (1.0 + port_ret)
 
-                    pts = np.column_stack([w_clip, p_clip])
-                    vals = interp(pts)
+                # Next-period proportions: (F, Q, n)
+                denom = 1.0 + port_ret
+                p_next = (new_p_f[:, None, :] * (1.0 + joint_returns[None, :, :])) / denom[:, :, None]
 
-                    bankrupt = w_next <= 0
-                    if np.any(bankrupt):
-                        vals[bankrupt] = utility_function(0.001)
+                # Clip for interpolation
+                w_clip = np.clip(w_next, w_grid[0], w_grid[-1])
+                p_clip = np.clip(p_next, p_single_grid[0], p_single_grid[-1])
 
-                    ev = np.dot(vals, joint_weights)
+                # Assemble interpolation points: (F*Q, 1+n)
+                pts = np.column_stack([w_clip.ravel(), p_clip.reshape(F * Q, n)])
+                vals = interp(pts)
 
-                    if ev > best_val:
-                        best_val = ev
-                        best_act = a.copy()
+                # Handle bankruptcy
+                bankrupt = w_next.ravel() <= 0
+                if np.any(bankrupt):
+                    vals[bankrupt] = utility_function(0.001)
 
-                if best_val == -np.inf:
-                    best_val = utility_function(0.01)
-                V_t[(wi,) + pidx] = best_val
-                if best_act is not None:
-                    pol_t[(wi,) + pidx] = best_act
+                # Expected values per action: (F,)
+                evs = vals.reshape(F, Q) @ joint_weights
+
+                best = np.argmax(evs)
+
+                # Prefer zero action when improvement is negligible
+                # (avoids floating-point noise picking random actions
+                #  when all values are nearly identical, e.g. A=50)
+                if zero_act_idx is not None and zero_act_idx in fidx:
+                    zero_pos = np.where(fidx == zero_act_idx)[0][0]
+                    zero_ev = evs[zero_pos]
+                    best_ev = evs[best]
+                    rel_improv = abs(best_ev - zero_ev) / (abs(zero_ev) + 1e-10)
+                    if rel_improv < 1e-4:
+                        best = zero_pos
+
+                V_t[(wi,) + pidx] = evs[best]
+                pol_t[(wi,) + pidx] = valid_actions[fidx[best]]
                 n_computed += 1
 
         v_grids[t] = V_t
@@ -168,7 +209,7 @@ def solve_dp(
     # Pack config for simulation
     config = dict(
         n=n, T=T, r=r, A=A, a_k=a_k, s_k=s_k, std_k=std_k,
-        leverage_factor=leverage_factor,
+        leverage_factor=leverage_factor, p_init=p_init,
         w_grid=w_grid, p_single_grid=p_single_grid,
         utility_function=utility_function,
     )
@@ -177,7 +218,7 @@ def solve_dp(
 
 
 def simulate_dp(v_grids, policy, config, p_init=None,
-                num_episodes=2000, seed=42, verbose=True):
+                num_episodes=2000, seed=42, verbose=True, returns=None):
     """Forward-simulate the optimal policy.
 
     Returns:
@@ -191,12 +232,32 @@ def simulate_dp(v_grids, policy, config, p_init=None,
     utility_function = config['utility_function']
 
     if p_init is None:
+        p_init = config.get('p_init')
+    if p_init is None:
         w = 0.60 / n
         p_init = np.array([1.0 - n * w] + [w] * n)
     else:
         p_init = np.array(p_init, dtype=float)
 
-    np.random.seed(seed)
+    if returns is None:
+        np.random.seed(seed)
+
+    # Build policy interpolators for smooth action lookup
+    policy_interps = {}
+    for t_step in range(T):
+        pol_t = policy[t_step]  # shape: (wealth_points, n_pg, ..., n_pg, n)
+        interps = []
+        for k in range(n):
+            interp = RegularGridInterpolator(
+                (w_grid,) + (p_single_grid,) * n,
+                pol_t[..., k],
+                method='linear',
+                bounds_error=False,
+                fill_value=None,
+            )
+            interps.append(interp)
+        policy_interps[t_step] = interps
+
     utilities = []
     terminal_wealths = []
     wealth_paths = np.zeros((num_episodes, T + 1))
@@ -212,17 +273,18 @@ def simulate_dp(v_grids, policy, config, p_init=None,
         for t_step in range(T):
             p_risky = p[1:].copy()
 
-            wi = int(np.argmin(np.abs(w_grid - W)))
-            pidx = tuple(
-                int(np.argmin(np.abs(p_single_grid - p_risky[k])))
-                for k in range(n)
-            )
-            action = policy[t_step][(wi,) + pidx].copy()
+            # Interpolate policy for smooth action (instead of snap-to-grid)
+            W_clip = np.clip(W, w_grid[0], w_grid[-1])
+            p_clip = np.clip(p_risky, p_single_grid[0], p_single_grid[-1])
+            state_pt = np.concatenate([[W_clip], p_clip]).reshape(1, -1)
+            action = np.array([
+                policy_interps[t_step][k](state_pt)[0] for k in range(n)
+            ])
 
             new_pr = p_risky + action
             new_cash = 1.0 - new_pr.sum()
 
-            max_lev = 1.0 + leverage_factor * max(W, 0.0)
+            max_lev = leverage_factor
             gross = np.abs(new_cash) + np.abs(new_pr).sum()
             if gross > max_lev + 1e-10:
                 scale = max_lev / gross
@@ -240,7 +302,7 @@ def simulate_dp(v_grids, policy, config, p_init=None,
                 traj_first.append((t_step, W, p.copy(), action.copy(),
                                    np.concatenate([[new_cash], new_pr])))
 
-            R = np.random.normal(a_k, std_k)
+            R = returns[ep, t_step] if returns is not None else np.random.normal(a_k, std_k)
             port_ret = new_cash * r + (new_pr * R).sum()
             W_new = W * (1.0 + port_ret)
 

@@ -65,7 +65,7 @@ def _sample_reachable_states(n, T, t, n_train, a_k, s_k, r, p_init_risky,
 
         # Enforce leverage constraint per sample
         gross = np.abs(new_cash) + np.abs(p_new).sum(axis=1)
-        max_lev = 1.0 + leverage_factor * np.maximum(W, 0.0)
+        max_lev = leverage_factor
         over = gross > max_lev + 1e-10
         if np.any(over):
             scale = np.where(over, max_lev / np.maximum(gross, 1e-12), 1.0)
@@ -97,11 +97,11 @@ def solve_dp(
     a_k=None, s_k=None,
     max_turnover=0.10, leverage_factor=2.0,
     wealth_min=0.05, wealth_max=3.5,
-    prop_min=-0.5, prop_max=1.5,
+    prop_min=None, prop_max=None,
     action_step=0.05, action_max=0.10,
     n_quad=5,
     hidden_size=128, n_train=5000, epochs=200, lr=1e-3,
-    p_init_risky=None,
+    p_init=None, p_init_risky=None,
 ):
     """Solve portfolio optimization via backward induction with NN value approximation.
 
@@ -111,16 +111,29 @@ def solve_dp(
         policy_nets: dict mapping time step -> PolicyNet
         config:      dict with all parameters needed for simulation
     """
+    # Auto-derive prop range from leverage_factor if not explicitly set
+    if prop_min is None:
+        prop_min = -(leverage_factor - 1.0) / 2.0
+    if prop_max is None:
+        prop_max = (leverage_factor + 1.0) / 2.0
+
     device = torch.device('cpu')
     a_k = np.array(a_k if a_k is not None else [0.08, 0.06, 0.10][:n])
     s_k = np.array(s_k if s_k is not None else [0.02, 0.015, 0.04][:n])
     std_k = np.sqrt(s_k)
 
-    if p_init_risky is None:
+    # Derive p_init_risky from p_init if provided
+    if p_init is not None and p_init_risky is None:
+        p_init = np.array(p_init, dtype=float)
+        p_init_risky = p_init[1:]  # strip cash
+    elif p_init_risky is None:
         w = 0.60 / n
         p_init_risky = np.array([w] * n)
+        p_init = np.array([1.0 - n * w] + [w] * n)
     else:
         p_init_risky = np.array(p_init_risky, dtype=float)
+        if p_init is None:
+            p_init = np.array([1.0 - p_init_risky.sum()] + list(p_init_risky))
 
     def utility_function(W):
         return (1.0 - np.exp(-A * np.clip(W, -20, 100))) / A
@@ -190,7 +203,7 @@ def solve_dp(
         for i in range(n_train):
             w = W_samples[i]
             p_risky = p_samples[i]
-            max_lev = 1.0 + leverage_factor * max(w, 0.0)
+            max_lev = leverage_factor
 
             # Check if current state is feasible
             p_cash = 1.0 - p_risky.sum()
@@ -199,6 +212,7 @@ def solve_dp(
                 continue
 
             best_val = -np.inf
+            zero_val = -np.inf
             best_act = np.zeros(n)
 
             for a in valid_actions:
@@ -238,12 +252,23 @@ def solve_dp(
 
                 ev = np.dot(vals, joint_weights)
 
+                # Track zero-action value for comparison
+                if np.allclose(a, 0.0):
+                    zero_val = ev
+
                 if ev > best_val:
                     best_val = ev
                     best_act = a.copy()
 
             if best_val == -np.inf:
                 best_val = utility_function(0.01)
+
+            # If best action is not meaningfully better than doing nothing,
+            # default to zero action to avoid fitting NN approximation noise
+            if zero_val > -np.inf:
+                rel_improv = abs(best_val - zero_val) / (abs(zero_val) + 1e-10)
+                if rel_improv < 1e-4:
+                    best_act = np.zeros(n)
 
             target_values[i] = best_val
             best_actions[i] = best_act
@@ -253,10 +278,15 @@ def solve_dp(
         states_t = torch.tensor(states_np, dtype=torch.float32, device=device)
         targets_t = torch.tensor(target_values, dtype=torch.float32, device=device)
 
-        # Normalize targets for stable training
+        # Normalize targets for stable training (skip if targets are near-constant)
         v_mean = float(targets_t.mean())
-        v_std = float(targets_t.std()) + 1e-8
-        targets_norm = (targets_t - v_mean) / v_std
+        v_std = float(targets_t.std())
+        if v_std < 1e-6:
+            # All targets nearly identical — normalization would amplify noise
+            targets_norm = targets_t - v_mean
+            v_std = 1.0  # denormalization becomes a no-op shift
+        else:
+            targets_norm = (targets_t - v_mean) / v_std
 
         net = ValueNet(1 + n, hidden_size).to(device)
         optimizer = torch.optim.Adam(net.parameters(), lr=lr)
@@ -296,7 +326,7 @@ def solve_dp(
 
     config = dict(
         n=n, T=T, r=r, A=A, a_k=a_k, s_k=s_k, std_k=std_k,
-        leverage_factor=leverage_factor,
+        leverage_factor=leverage_factor, p_init=p_init,
         wealth_min=wealth_min, wealth_max=wealth_max,
         prop_min=prop_min, prop_max=prop_max,
         action_step=action_step, action_max=action_max,
@@ -312,7 +342,7 @@ def solve_dp(
 
 
 def simulate_dp(v_nets, policy_nets, config, p_init=None,
-                num_episodes=2000, seed=42, verbose=True):
+                num_episodes=2000, seed=42, verbose=True, returns=None):
     """Forward-simulate the optimal policy using policy networks.
 
     At each step, uses the PolicyNet for fast action selection (single forward pass).
@@ -329,12 +359,15 @@ def simulate_dp(v_nets, policy_nets, config, p_init=None,
     max_turnover = config['max_turnover']
 
     if p_init is None:
+        p_init = config.get('p_init')
+    if p_init is None:
         w = 0.60 / n
         p_init = np.array([1.0 - n * w] + [w] * n)
     else:
         p_init = np.array(p_init, dtype=float)
 
-    np.random.seed(seed)
+    if returns is None:
+        np.random.seed(seed)
     utilities = []
     terminal_wealths = []
     wealth_paths = np.zeros((num_episodes, T + 1))
@@ -349,7 +382,7 @@ def simulate_dp(v_nets, policy_nets, config, p_init=None,
 
         for t_step in range(T):
             p_risky = p[1:].copy()
-            max_lev = 1.0 + leverage_factor * max(W, 0.0)
+            max_lev = leverage_factor
 
             # Policy net: state -> action (single forward pass)
             state = np.concatenate([[W], p_risky])
@@ -385,7 +418,7 @@ def simulate_dp(v_nets, policy_nets, config, p_init=None,
                 traj_first.append((t_step, W, p.copy(), action.copy(),
                                    np.concatenate([[new_cash], new_pr])))
 
-            R = np.random.normal(a_k, std_k)
+            R = returns[ep, t_step] if returns is not None else np.random.normal(a_k, std_k)
             port_ret = new_cash * r + (new_pr * R).sum()
             W_new = W * (1.0 + port_ret)
 
