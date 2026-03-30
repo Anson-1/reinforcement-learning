@@ -3,6 +3,7 @@ import itertools
 import time
 from scipy.special import roots_hermite
 from scipy.interpolate import RegularGridInterpolator
+from utils import cara_utility, build_feasible_actions
 
 
 def solve_dp(
@@ -11,7 +12,7 @@ def solve_dp(
     max_turnover=0.10, leverage_factor=1.0,
     wealth_points=15, wealth_min=0.05, wealth_max=3.5,
     prop_min=None, prop_max=None, prop_step=0.25,
-    action_step=0.05, action_max=0.10,
+    action_step=0.025, action_max=0.10,
     n_quad=5,
 ):
     """Solve the portfolio optimization via backward induction.
@@ -39,7 +40,7 @@ def solve_dp(
         p_init = np.array(p_init, dtype=float)
 
     def utility_function(W):
-        return (1.0 - np.exp(-A * np.clip(W, -20, 100))) / A
+        return cara_utility(W, A)
 
     # Quadrature setup
     nodes_1d, weights_1d = roots_hermite(n_quad)
@@ -71,12 +72,7 @@ def solve_dp(
     ])
 
     # Actions
-    action_vals = np.arange(-action_max, action_max + action_step * 0.5, action_step)
-    action_vals = np.round(action_vals, 6)
-    all_actions = np.array(list(itertools.product(action_vals, repeat=n)))
-    d_cash = -all_actions.sum(axis=1)
-    turnover = 0.5 * (np.abs(d_cash) + np.abs(all_actions).sum(axis=1))
-    valid_actions = all_actions[turnover <= max_turnover + 1e-10]
+    valid_actions = build_feasible_actions(n, action_max, action_step, max_turnover)
 
     # Find zero action index for tie-breaking
     zero_act_idx = None
@@ -135,7 +131,7 @@ def solve_dp(
                 p_risky = all_p_values[pi]
 
                 p_cash = 1.0 - p_risky.sum()
-                if np.abs(p_cash) + np.abs(p_risky).sum() > max_lev + 1.0:
+                if np.abs(p_cash) + np.abs(p_risky).sum() > max_lev + 1e-10:
                     V_t[(wi,) + pidx] = utility_function(0.01)
                     continue
 
@@ -174,7 +170,7 @@ def solve_dp(
                 vals = interp(pts)
 
                 # Handle bankruptcy
-                bankrupt = w_next.ravel() <= 0
+                bankrupt = w_next.ravel() <= 0.001
                 if np.any(bankrupt):
                     vals[bankrupt] = utility_function(0.001)
 
@@ -261,6 +257,7 @@ def simulate_dp(v_grids, policy, config, p_init=None,
     utilities = []
     terminal_wealths = []
     wealth_paths = np.zeros((num_episodes, T + 1))
+    alloc_history = np.zeros((num_episodes, T, n + 1))
     final_props = []
     short_steps = np.zeros(n, dtype=int)
     traj_first = []
@@ -294,6 +291,8 @@ def simulate_dp(v_grids, policy, config, p_init=None,
             for k in range(n):
                 if new_pr[k] < -1e-10:
                     short_steps[k] += 1
+
+            alloc_history[ep, t_step] = np.concatenate([[new_cash], new_pr])
 
             if t_step == T - 1:
                 final_props.append([new_cash] + list(new_pr))
@@ -368,6 +367,7 @@ def simulate_dp(v_grids, policy, config, p_init=None,
         utilities=np.array(utilities),
         terminal_wealths=np.array(terminal_wealths),
         wealth_paths=wealth_paths,
+        alloc_history=alloc_history,
         final_props=np.array(final_props),
         short_steps=short_steps,
     )
